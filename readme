@@ -1,0 +1,5 @@
+说明：
+Nvidia-Communication-Test 目录内容用于测试nccl-test、cuda-sample、p2p。
+vLLM 目录内容用于测试模型在当前显卡上的性能。
+
+具体使用说明，请进入相应目录查看readme。
