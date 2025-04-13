@@ -1,1 +1,223 @@
-Nvidia-Communication
+# NCCL 和 CUDA 样例测试脚本
+
+一、概述
+
+该脚本用于运行 **NCCL** 和 **CUDA 样例测试工具**，测试 GPU 的通信性能、带宽和延迟，并将结果输出到 CSV 文件中，便于后续分析。脚本支持以下功能：
+
+1. **NCCL 测试**：运行 NCCL 工具（如 `all_reduce_perf` 和 `all_gather_perf`），测试多 GPU 的通信性能。
+2. **带宽测试**：运行 `bandwidthTest` 工具，测试主机到设备（H2D）、设备到主机（D2H）和设备到设备（D2D）的带宽。
+3. **P2P 带宽和延迟测试**：运行 `p2pBandwidthLatencyTest` 工具，测试 GPU 间点对点（P2P）通信的带宽和延迟。
+4. **GPU 信息检测**：获取 GPU 型号、数量以及可选的 VBIOS 版本信息。
+5. **结果输出**：将所有测试结果写入一个 CSV 文件，文件名格式为 `p2p-bandwidth-nccl-<日期时间>.csv`。
+
+---
+
+二、功能说明
+
+1. NCCL 测试
+	- 使用 NCCL 工具（如 `all_reduce_perf` 和 `all_gather_perf`）测试多 GPU 的通信性能。
+	- 支持指定 GPU 数量（如 2、4、8 GPUs）进行测试。
+	- 提取测试结果中的 **平均总线带宽（Avg bus bandwidth）**。
+
+2. 带宽测试
+	- 使用 `bandwidthTest` 工具测试以下带宽：
+ 	 - **主机到设备（H2D）** 带宽。
+ 	 - **设备到主机（D2H）** 带宽。
+ 	 - **设备到设备（D2D）** 带宽。
+	- 提取测试结果中的带宽值。
+
+3. P2P 带宽和延迟测试
+	- 使用 `p2pBandwidthLatencyTest` 工具测试，并提取以下结果：
+  	- **Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)**。
+  	- **Bidirectional P2P=Enabled Bandwidth Matrix (GB/s)**
+
+4. GPU 信息检测
+	- 使用 `nvidia-smi` 工具检测 GPU 型号和数量。
+	- 可选地检测 GPU 的 VBIOS 版本。
+
+5. 结果输出
+	- 将所有测试结果写入一个 CSV 文件，文件内容包括：
+ 	 1. 主机名和 GPU 信息。
+ 	 2. GPU ID 和 VBIOS 版本。
+ 	 3. NCCL 测试结果。
+ 	 4. 带宽测试结果。
+ 	 5. P2P 带宽和延迟测试结果。
+
+---
+
+三、环境要求
+
+	1. **Python**：
+ 	  - Python 3.12或更高版本。
+
+	2. **cuda-samples、nccl-test工具**：
+  	 - 确保已安装 CUDA 工具包，并包含以下二进制文件：
+  	   - `all_reduce_perf` 和 `all_gather_perf`（来自 NCCL 测试工具）。
+   	  - `bandwidthTest`。
+   	  - `p2pBandwidthLatencyTest`。
+
+	3. **NVIDIA 驱动**：
+ 	  - 确保已安装 NVIDIA 驱动，并可以使用 `nvidia-smi`。
+ 	  
+ 	4. **cuda**:
+ 		- 确保cuda已经安装。
+ 	
+ 	5. **nccl**
+ 		- 确保nccl已经安装。
+
+通过setup_env.sh脚本可一键安装cuda、驱动、nccl、cuda-sample、nccl-test等，命令执行：
+	chmod +x setup_env.sh
+	sh setup_env.sh
+---
+
+四、使用方法
+
+1、 运行脚本
+
+	运行以下命令，测试所有功能：
+
+	```bash
+	python3 nccl.py \
+ 	   --nccl-test-path /path/to/nccl-tests/ \
+  	  --bandwidth-test-path /path/to/bandwidthTest \
+  	  --p2pBandwidthLatencyTest-path /path/to/p2pBandwidthLatencyTest \
+    	-b 6G -e 24G -f 2 -g 8 \
+    	--device=all --mode=range --start=64000000 --end=256000000 --increment=32000000 \
+  	  --vbios
+	```
+
+2、参数说明
+
+	| 参数名称                          | 说明                                                                                     | 默认值                |
+	|-----------------------------------|------------------------------------------------------------------------------------------|-----------------------|
+	| `--nccl-test-path`                | NCCL 测试工具的路径（如 `all_reduce_perf` 和 `all_gather_perf` 所在目录）。               | 必填                 |
+	| `--bandwidth-test-path`           | `bandwidthTest` 工具的路径。                                                             | 必填                 |
+	| `--p2pBandwidthLatencyTest-path`  | `p2pBandwidthLatencyTest` 工具的路径。                                                   | 必填                 |
+	| `-b`                              | NCCL 测试的最小消息大小。                                                                | `6G`                 |
+	| `-e`                              | NCCL 测试的最大消息大小。                                                                | `24G`                |
+	| `-f`                              | NCCL 测试的步长因子。                                                                    | `2`                  |
+	| `-g`                              | 测试的 GPU 数量。                                                                        | `8`                  |
+	| `--device`                        | 测试的设备（适用于 `bandwidthTest` 和 `p2pBandwidthLatencyTest`）。                      | `all`                |
+	| `--mode`                          | 测试模式（适用于 `bandwidthTest` 和 `p2pBandwidthLatencyTest`）。                        | `range`              |
+	| `--start`                         | 测试的起始大小（适用于 `bandwidthTest` 和 `p2pBandwidthLatencyTest`）。                  | `64000000`           |
+	| `--end`                           | 测试的结束大小（适用于 `bandwidthTest` 和 `p2pBandwidthLatencyTest`）。                  | `256000000`          |
+	| `--increment`                     | 测试的步长（适用于 `bandwidthTest` 和 `p2pBandwidthLatencyTest`）。                      | `32000000`           |
+	| `--vbios`                         | 启用 GPU VBIOS 检测。                                                                    | 关闭                 |
+
+---
+
+3、 示例输出
+
+	### 日志文件
+
+	运行 `p2pBandwidthLatencyTest` 后，会生成一个日志文件，例如：
+
+	```
+	p2pBandwidthLatencyTest-20250409_143045.log
+	```
+
+	日志文件内容示例：
+
+	```
+	Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s)
+ 	  D\D     0      1      2      3      4      5      6      7 
+  	   0 940.70  21.85  22.04  21.90  22.14  22.09  22.08  22.22 
+   	  1  21.88 949.85  21.93  22.00  22.17  22.35  22.04  22.21 
+     	2  21.99  21.84 949.85  21.93  22.13  22.20  22.06  22.08 
+    	 3  21.40  21.48  21.29 949.85  21.63  21.56  21.70  21.52 
+    	 4  21.61  21.61  21.60  21.48 949.85  21.45  21.49  21.49 
+    	 5  22.05  22.15  22.03  22.12  22.00 952.16  21.90  21.97 
+     	6  22.23  22.21  21.87  22.11  21.98  22.06 950.43  21.98 
+    	 7  22.06  22.01  21.90  21.96  22.10  21.93  22.05 951.00 
+	Bidirectional P2P=Enabled Bandwidth Matrix (GB/s)
+  	 D\D     0      1      2      3      4      5      6      7 
+   	  0 942.40  27.93  28.03  28.08  30.95  31.31  31.39  31.30 
+    	 1  27.90 947.26  27.98  27.72  30.69  31.21  31.30  31.48 
+	```
+
+	### CSV 文件
+
+	生成的 CSV 文件名为：
+
+	```
+	p2p-bandwidth-nccl-20250409_143045.csv
+	```
+
+	文件内容示例：
+
+	```
+	hostname-8 GPUs-NVIDIA GeForce RTX 4090
+
+	GPU ID,VBIOS Version
+	GPU 0,95.02.3C.00.02
+	GPU 1,95.02.3C.C0.7B
+	GPU 2,95.02.3C.C0.7B
+	GPU 3,95.02.3C.C0.7B
+	GPU 4,95.02.3C.C0.7B
+	GPU 5,95.02.3C.C0.7B
+	GPU 6,95.02.3C.C0.7B
+	GPU 7,95.02.3C.C0.7B
+
+	Test Type,Command,2 GPUs,4 GPUs,8 GPUs
+	all_reduce_perf,/path/to/all_reduce_perf -b 6G -e 24G -f 2 -g 2,12.5,N/A,N/A
+	all_reduce_perf,/path/to/all_reduce_perf -b 6G -e 24G -f 2 -g 4,12.5,13.2,N/A
+	all_reduce_perf,/path/to/all_reduce_perf -b 6G -e 24G -f 2 -g 8,12.5,13.2,14.1
+
+	Test-Type,Command,H2D,D2H,D2D
+	bandwidthTest,/path/to/bandwidthTest --device=all --mode=range --start=64000000 --end=256000000 --increment=32000000,215.4,214.5,7519.2
+
+	test-type,Command,Unidirectional P2P=Enabled Bandwidth (P2P Writes) Matrix (GB/s),Bidirectional P2P=Enabled Bandwidth Matrix (GB/s)
+	p2pBandwidthLatencyTest,/path/to/p2pBandwidthLatencyTest --device=all --mode=range --start=64000000 --end=256000000 --increment=32000000,"D\D     0      1      2      3      	4      5      6      7
+	0 940.70  21.85  22.04  21.90  22.14  22.09  22.08  22.22
+	1  21.88 949.85  21.93  22.00  22.17  22.35  22.04  22.21
+	...", "D\D     0      1      2      3      4      5      6      7
+	0 942.40  27.93  28.03  28.08  30.95  31.31  31.39  31.30
+	1  27.90 947.26  27.98  27.72  30.69  31.21  31.30  31.48
+	..."
+	```
+
+---
+
+五、注意事项
+
+	1. 确保所有测试工具的路径正确。
+	2. 确保当前用户对日志文件和 CSV 文件的保存目录具有写权限。
+	3. 如果某些测试工具不可用，相关部分的结果将不会写入 CSV 文件。
+
+---
+
+通过以上说明，您可以使用该脚本完成 GPU 性能测试。如果有任何问题，请随时联系开发者！
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
