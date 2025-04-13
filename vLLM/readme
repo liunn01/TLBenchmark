@@ -1,1 +1,85 @@
-1
+GPU Performance Benchmark Tool
+一、	简介
+该脚本用于运行 GPU 性能基准测试，支持配置服务器参数和基准测试参数，并生成日志、CSV 文件和性能图表。
+________________________________________
+二、	前置条件
+在运行脚本之前，请确保以下环境已正确配置：
+1.	安装 NVIDIA 驱动和 CUDA：
+确保已安装 NVIDIA 驱动和 CUDA 工具包，并且可以使用 nvidia-smi 命令查看 GPU 状态。
+2.	安装 Conda：
+如果未安装 Conda，请访问 Conda 官网 下载并安装 Miniconda 或 Anaconda。
+3.	创建虚拟环境：
+conda create -n benchmark_env python=3.12 -y
+conda activate benchmark_env
+4.	安装依赖项：
+使用以下命令安装所需的 Python 包：
+pip install -r requirement.txt
+5.	检查 vLLM 安装：
+确保已安装 vLLM。如果未安装，请运行以下命令：
+pip list | grep vllm
+
+三、	使用方法
+运行脚本时，可以通过命令行传递参数来配置服务器和基准测试。以下是参数的详细说明。
+服务器配置参数
+参数名	                  类型	默认值	                                说明
+--model	                  str   DeepSeek-R1-Distill-Llama-8B            模型路径，用于指定要加载的模型。
+--host	                  str   localhost	                              服务器主机地址。              
+--port	                  int   8335	                                  服务器端口号。
+--gpu	                    str   0	                                      使用的 GPU 设备 ID（逗号分隔）。
+--tensor-parallel-size	  int   1	                                      Tensor 并行度大小。
+--data-parallel-size	    int   1	                                      数据并行度大小。
+--max-num-batched-tokens	int   64000	                                  每批次的最大 token 数量。
+--max_num_seqs	          int   256	                                    每批次的最大序列数。
+--trust-remote-code	     flag	  False	                                  是否信任远程代码（加载模型时使用）。
+
+
+基准测试配置参数
+参数名	                 类型	  默认值	                                说明
+--random-input-len      	int   20	                                    随机输入 token 的长度。
+--random-output-len	      int   20	                                    随机输出 token 的长度。
+--concurrency-levels    	str   4,8,16,32,64,128,256	                  并发级别（逗号分隔的整数列表）。
+--prompts-multiplier	    int   5	                                      提示数量相对于并发级别的倍数。
+--log-dir	                str   benchmark_logs                          日志文件的存储目录。
+________________________________________
+四、	输出文件
+运行脚本后，会生成以下文件：
+1.	日志文件：
+    存储服务器运行日志和基准测试日志。
+    默认存储在 vllm_server_log 和 benchmark_output_log 目录中。
+2.	CSV 文件：
+    存储基准测试结果，文件名格式为 benchmark-<timestamp>.csv。
+3.	性能图表：
+    基准测试结果的图表，文件名格式为 benchmark-<timestamp>.png。
+________________________________________
+五、	示例命令
+使用默认参数运行
+python new2.py
+
+指定服务器配置
+python new2.py --model /path/to/model --host 127.0.0.1 --port 9000 --gpu 0,1 --tensor-parallel-size 2 --data-parallel-size 4
+
+指定基准测试配置
+python new2.py --random-input-len 50 --random-output-len 50 --concurrency-levels 4,8,16 --prompts-multiplier 10 --log-dir ./my_logs
+
+完整示例
+python new2.py --model /path/to/model --host 127.0.0.1 --port 9000 --gpu 0,1 \
+--tensor-parallel-size 2 --data-parallel-size 4 --random-input-len 50 --random-output-len 50 --concurrency-levels 4,8,16,32 --prompts-multiplier 10 --log-dir ./my_logs --trust-remote-code
+________________________________________
+六、	注意事项
+1.	默认值：
+    如果未指定参数，脚本会使用默认值。
+2.	日志目录：
+    确保指定的日志目录存在或具有写入权限。
+3.	GPU 配置：
+    使用 --gpu 参数指定 GPU 设备 ID，例如 0 或 0,1。
+4.	并发级别：
+    使用 --concurrency-levels 参数指定基准测试的并发级别，多个值用逗号分隔。
+________________________________________
+七、	联系方式
+如有问题，请联系开发者或提交问题到相关的代码仓库。
+
+
+
+
+
+
