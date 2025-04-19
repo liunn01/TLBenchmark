@@ -51,8 +51,8 @@ def run_nccl_test(test_path, b, e, f, g):
     return None
 
 
-def parse_bandwidth_test_output(output):
-    """Parse bandwidthTest output to extract H2D, D2H, and D2D results."""
+def parse_bandwidth_test_output(output, gpu_count):
+    """Parse bandwidthTest output to extract the last H2D, D2H, and D2D results."""
     h2d_bandwidth = None
     d2h_bandwidth = None
     d2d_bandwidth = None
@@ -60,23 +60,32 @@ def parse_bandwidth_test_output(output):
     lines = output.splitlines()
     for i, line in enumerate(lines):
         if "Host to Device Bandwidth" in line:
-            # Extract the last value in the H2D section
+            # Locate the H2D section and extract the last value
             while i < len(lines) and "Bandwidth(GB/s)" not in lines[i]:
                 i += 1
             if i + 1 < len(lines):
-                h2d_bandwidth = lines[i + 1].split()[-1]
+                # Extract the last line in the H2D section
+                while i + 1 < len(lines) and lines[i + 1].strip():
+                    i += 1
+                h2d_bandwidth = float(lines[i].split()[-1]) / gpu_count  # 最后一个值除以 GPU 数量
         elif "Device to Host Bandwidth" in line:
-            # Extract the last value in the D2H section
+            # Locate the D2H section and extract the last value
             while i < len(lines) and "Bandwidth(GB/s)" not in lines[i]:
                 i += 1
             if i + 1 < len(lines):
-                d2h_bandwidth = lines[i + 1].split()[-1]
+                # Extract the last line in the D2H section
+                while i + 1 < len(lines) and lines[i + 1].strip():
+                    i += 1
+                d2h_bandwidth = float(lines[i].split()[-1]) / gpu_count  # 最后一个值除以 GPU 数量
         elif "Device to Device Bandwidth" in line:
-            # Extract the last value in the D2D section
+            # Locate the D2D section and extract the last value
             while i < len(lines) and "Bandwidth(GB/s)" not in lines[i]:
                 i += 1
             if i + 1 < len(lines):
-                d2d_bandwidth = lines[i + 1].split()[-1]
+                # Extract the last line in the D2D section
+                while i + 1 < len(lines) and lines[i + 1].strip():
+                    i += 1
+                d2d_bandwidth = float(lines[i].split()[-1]) / gpu_count  # 最后一个值除以 GPU 数量
 
     return h2d_bandwidth, d2h_bandwidth, d2d_bandwidth
 
@@ -334,9 +343,15 @@ def run_p2p_bandwidth_latency_test(test_path, device="all", mode="range", start=
 
 def main():
     parser = argparse.ArgumentParser(description="NCCL and CUDA Sample Test Script")
-    parser.add_argument("--nccl-test-path", type=str, help="Path to the NCCL test binaries directory (e.g., /path/to/nccl-tests/)")
-    parser.add_argument("--bandwidth-test-path", type=str, help="Path to the bandwidthTest binary (e.g., /path/to/bandwidthTest)")
-    parser.add_argument("--p2pBandwidthLatencyTest-path", type=str, help="Path to the p2pBandwidthLatencyTest binary (e.g., /path/to/p2pBandwidthLatencyTest)")
+    parser.add_argument("--nccl-test-path", type=str, 
+                        default="./nccl-tests/build/",  # 设置默认值
+                        help="Path to the NCCL test binaries directory (default: %(default)s)")
+    parser.add_argument("--bandwidth-test-path", type=str, 
+                        default="./cuda-samples/build/Samples/1_Utilities/bandwidthTest/bandwidthTest",
+                        help="Path to the bandwidthTest binary (default: %(default)s)")
+    parser.add_argument("--p2pBandwidthLatencyTest-path", type=str, 
+                        default="./cuda-samples/build/Samples/5_Domain_Specific/p2pBandwidthLatencyTest/p2pBandwidthLatencyTest",  # 设置默认值
+                        help="Path to the p2pBandwidthLatencyTest binary (default: %(default)s)")
     parser.add_argument("-b", type=str, default="6G", help="Minimum size (default: 6G, for nccl-test)")
     parser.add_argument("-e", type=str, default="24G", help="Maximum size (default: 24G, for nccl-test)")
     parser.add_argument("-f", type=str, default="2", help="Step factor (default: 2, for nccl-test)")
@@ -399,7 +414,7 @@ def main():
             increment=args.increment
         )
         if output:
-            h2d, d2h, d2d = parse_bandwidth_test_output(output)
+            h2d, d2h, d2d = parse_bandwidth_test_output(output, gpu_count)  # 传递 GPU 数量
             bandwidth_results = {
                 "command": f"{args.bandwidth_test_path} --device={args.device} --mode={args.mode} --start={args.start} --end={args.end} --increment={args.increment}",
                 "h2d": h2d,
