@@ -34,7 +34,7 @@ def parse_arguments():
                         help='Tensor parallelism size (default: %(default)s)')
     parser.add_argument('--data-parallel-size', type=int, default=1,
                         help='Data parallelism size (default: %(default)s)')
-    parser.add_argument('--max-num-batched-tokens', type=int, default=64000,
+    parser.add_argument('--max-num-batched-tokens', type=int, default=131072,  # 修改默认值为 131072
                         help='Maximum number of batched tokens (default: %(default)s)')
     parser.add_argument('--max_num_seqs', type=int, default=256,
                         help='Maximum number of sequences in a batch (default: %(default)s)')
@@ -163,7 +163,6 @@ class ProcessManager:
             print(f"Error cleaning up child processes: {e}")
             cleanup_success = False
             
-        # Clean up remaining processes
         try:
             self._kill_zombie_processes()
         except Exception as e:
@@ -189,6 +188,9 @@ class ProcessManager:
             cleanup_success = False
             
         print("[Cleanup] " + ("Completed successfully" if cleanup_success else "Completed with errors"))
+        
+        # Ensure program exit
+        sys.exit(0)
     
     def _kill_zombie_processes(self):
         """Clean up remaining Python processes"""
@@ -673,11 +675,13 @@ def main():
             
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user.")
+        if 'pm' in locals():
+            pm.cleanup()
+        sys.exit(0)  # 确保程序退出
     except Exception as e:
         print(f"\n[Error] {str(e)}")
         sys.exit(1)
     finally:
-        # Ensure cleanup method is called in any case
         try:
             if 'pm' in locals():
                 pm.cleanup()
