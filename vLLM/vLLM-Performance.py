@@ -52,6 +52,12 @@ def parse_arguments():
                         help='Directory for logs (default: %(default)s)')
     parser.add_argument('--trust-remote-code', action='store_true',
                         help='Trust remote code when loading models (default: %(default)s)')
+    parser.add_argument('--p2pBandwidthLatencyTest-path', type=str, 
+                        default="./cuda-samples/build/Samples/5_Domain_Specific/p2pBandwidthLatencyTest/p2pBandwidthLatencyTest",
+                        help='Path to the p2pBandwidthLatencyTest binary (default: %(default)s)')
+    parser.add_argument('--bandwidth-test-path', type=str, 
+                        default="./cuda-samples/build/Samples/1_Utilities/bandwidthTest/bandwidthTest",
+                        help='Path to the bandwidthTest binary (default: %(default)s)')
     
     return parser.parse_args()
 
