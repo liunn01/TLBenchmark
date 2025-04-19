@@ -56,13 +56,13 @@ ________________________________________
 python new2.py
 
 指定服务器配置
-python new2.py --model /path/to/model --host 127.0.0.1 --port 9000 --gpu 0,1 --tensor-parallel-size 2 --data-parallel-size 4
+python vLLM-Performance.py --model /path/to/model --host 127.0.0.1 --port 9000 --gpu 0,1 --tensor-parallel-size 2 --data-parallel-size 4
 
 指定基准测试配置
-python new2.py --random-input-len 50 --random-output-len 50 --concurrency-levels 4,8,16 --prompts-multiplier 10 --log-dir ./my_logs
+python vLLM-Performance.py --random-input-len 50 --random-output-len 50 --concurrency-levels 4,8,16 --prompts-multiplier 10 --log-dir ./my_logs
 
 完整示例
-python new2.py --model /path/to/model --host 127.0.0.1 --port 9000 --gpu 0,1 \
+python vLLM-Performance.py --model /path/to/model --host 127.0.0.1 --port 9000 --gpu 0,1 \
 --tensor-parallel-size 2 --data-parallel-size 4 --random-input-len 50 --random-output-len 50 --concurrency-levels 4,8,16,32 --prompts-multiplier 10 --log-dir ./my_logs --trust-remote-code
 ________________________________________
 六、	注意事项
