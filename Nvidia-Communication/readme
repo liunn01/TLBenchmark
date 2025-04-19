@@ -77,7 +77,7 @@
 	运行以下命令，测试所有功能：
 
 	```bash
-	python3 nccl.py \
+	python3 nccl-bandwitch-p2p.py \
  	   --nccl-test-path /path/to/nccl-tests/ \
   	  --bandwidth-test-path /path/to/bandwidthTest \
   	  --p2pBandwidthLatencyTest-path /path/to/p2pBandwidthLatencyTest \
