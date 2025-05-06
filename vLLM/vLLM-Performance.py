@@ -565,10 +565,14 @@ def main():
         
         # Prepare log files
         current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+        model_name = os.path.basename(args.model)  # 提取模型名称
+        csv_file = os.path.join(
+            log_dirs[1],
+            f"{model_name}-Input{args.random_input_len}-Output{args.random_output_len}-{current_time}.csv"
+        )  # CSV 文件路径
+        plot_file = os.path.join(log_dirs[1], f"benchmark-{current_time}.png")  # Chart 文件路径
         server_log = os.path.join(log_dirs[0], f"vllm-{current_time}.log")
         benchmark_log = os.path.join(log_dirs[1], f"benchmark-{current_time}.log")
-        csv_file = os.path.join(log_dirs[1], f"benchmark-{current_time}.csv")  # CSV file path
-        plot_file = os.path.join(log_dirs[1], f"benchmark-{current_time}.png")  # Chart file path
         
         # Start vLLM server
         vllm_cmd = [
@@ -578,7 +582,6 @@ def main():
             "--port", str(args.port),
             "--tensor-parallel-size", str(args.tensor_parallel_size),
             "--data-parallel-size", str(args.data_parallel_size),  # 新增参数
-            "--max-num-batched-tokens", str(args.max_num_batched_tokens),
             "--max-num-seqs", str(args.max_num_seqs)
         ]
         
