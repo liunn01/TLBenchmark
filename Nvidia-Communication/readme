@@ -86,6 +86,9 @@
   	  --vbios
 	```
 
+     或者 使用默认路径，命令如下：Nvidia-Communication.tar.gz解压出来即可使用
+     python nccl-bandwitch-p2p.py  -b 1G -e 8G -f 2 -g 8      --device=all --mode=range --start=64000000 --end=256000000 --increment=32000000        --vbios --powerinfo
+
 2、参数说明
 
 	| 参数名称                          | 说明                                                                                     | 默认值                |
