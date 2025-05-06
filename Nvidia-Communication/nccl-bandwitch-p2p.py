@@ -31,6 +31,49 @@ def get_gpu_vbios_info():
         return []
 
 
+def get_gpu_power_info():
+    """Retrieve GPU power information and Serial Number using nvidia-smi -q -i <gpu_id>."""
+    try:
+        power_info = []
+        gpu_model, gpu_count = get_gpu_info()  # 获取 GPU 数量
+
+        for gpu_id in range(gpu_count):
+            # 针对每个 GPU 单独运行 nvidia-smi -q -i <gpu_id>
+            output = subprocess.check_output(["nvidia-smi", "-q", "-i", str(gpu_id)], text=True)
+            current_gpu = {
+                "gpu_id": gpu_id,
+                "serial_number": None,
+                "default_power_limit": None,
+                "current_power_limit": None,
+                "max_power_limit": None
+            }
+
+            in_power_readings = False  # 标记是否在 "GPU Power Readings" 部分
+
+            for line in output.splitlines():
+                line = line.strip()
+                if line.startswith("Serial Number"):
+                    current_gpu["serial_number"] = line.split(":")[1].strip()
+                elif line.startswith("GPU Power Readings"):
+                    in_power_readings = True
+                elif line == "" or line.startswith("GPU") or line.startswith("Clocks"):
+                    in_power_readings = False
+                elif in_power_readings:
+                    if line.startswith("Default Power Limit"):
+                        current_gpu["default_power_limit"] = line.split(":")[1].strip()
+                    elif line.startswith("Current Power Limit"):
+                        current_gpu["current_power_limit"] = line.split(":")[1].strip()
+                    elif line.startswith("Max Power Limit"):
+                        current_gpu["max_power_limit"] = line.split(":")[1].strip()
+
+            power_info.append(current_gpu)
+
+        return power_info
+    except Exception as e:
+        print(f"Error retrieving GPU power info: {e}")
+        return []
+
+
 def run_nccl_test(test_path, b, e, f, g):
     """Run NCCL test and extract Avg bus bandwidth."""
     try:
@@ -212,11 +255,11 @@ def write_bandwidth_test_results(command, h2d, d2h, d2d, output_file="bandwidth_
     print(f"Bandwidth test results written to {output_file}")
 
 
-def write_combined_results(hostname, gpu_model, nccl_results, vbios_versions, bandwidth_results, p2p_results):
-    """Write combined NCCL, bandwidthTest, and p2pBandwidthLatencyTest results to a CSV file."""
+def write_combined_results(hostname, gpu_model, nccl_results, vbios_versions, bandwidth_results, p2p_results, power_info=None):
+    """Write combined NCCL, bandwidthTest, P2P Bandwidth Latency Test, and GPU info results to a CSV file."""
     # 获取当前日期和时间并生成文件名
     datetime_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = f"p2p-bandwidth-nccl-{datetime_str}.csv"  # 将文件名中的 'P2P' 改为小写 'p2p'
+    output_file = f"{gpu_model.replace(' ', '_')}-{datetime_str}.csv"
 
     with open(output_file, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
@@ -227,10 +270,19 @@ def write_combined_results(hostname, gpu_model, nccl_results, vbios_versions, ba
         # 写入空行分隔表格
         writer.writerow([])
 
-        # 写入 GPU VBIOS 信息
-        writer.writerow(["GPU ID", "VBIOS Version"])
-        for idx, vbios in enumerate(vbios_versions):
-            writer.writerow([f"GPU {idx}", vbios])
+        # 写入 VBIOS 和 GPU 功率信息到同一个表
+        writer.writerow(["GPU ID", "VBIOS Version", "Serial Number (SN)", "Default Power Limit", "Current Power Limit", "Max Power Limit"])
+        for idx in range(len(vbios_versions)):
+            vbios = vbios_versions[idx] if idx < len(vbios_versions) else "N/A"
+            power = power_info[idx] if power_info and idx < len(power_info) else {}
+            writer.writerow([
+                idx,
+                vbios,
+                power.get("serial_number", "N/A"),
+                power.get("default_power_limit", "N/A"),
+                power.get("current_power_limit", "N/A"),
+                power.get("max_power_limit", "N/A")
+            ])
 
         # 写入空行分隔表格
         writer.writerow([])
@@ -276,6 +328,17 @@ def write_combined_results(hostname, gpu_model, nccl_results, vbios_versions, ba
                 unidirectional_data,  # 写入 Unidirectional 数据
                 bidirectional_data    # 写入 Bidirectional 数据
             ])
+
+        # 写入空行分隔表格
+        writer.writerow([])
+
+        # 写入 nvidia-smi topo -m 输出
+        try:
+            topo_output = subprocess.check_output(["nvidia-smi", "topo", "-m"], text=True)
+            writer.writerow(["NVIDIA-SMI Topology"])
+            writer.writerow([topo_output])  # 将整个输出作为单个单元格写入
+        except Exception as e:
+            writer.writerow(["NVIDIA-SMI Topology", f"Error retrieving topology: {e}"])
 
     print(f"Combined results written to {output_file}")
 
@@ -362,6 +425,7 @@ def main():
     parser.add_argument("--end", type=str, default="256000000", help="End size (default: 256000000, for bandwidthTest and p2pBandwidthLatencyTest)")
     parser.add_argument("--increment", type=str, default="32000000", help="Increment size (default: 32000000, for bandwidthTest and p2pBandwidthLatencyTest)")
     parser.add_argument("--vbios", action="store_true", help="Enable VBIOS detection (default: disabled)")
+    parser.add_argument("--powerinfo", action="store_true", help="Enable GPU power info extraction (default: disabled)")
     args = parser.parse_args()
 
     hostname = socket.gethostname()
@@ -375,10 +439,15 @@ def main():
     }
     bandwidth_results = None
     p2p_results = None
+    power_info = None
 
     # Check if VBIOS detection is enabled
     if args.vbios:
         vbios_versions = get_gpu_vbios_info()
+
+    # Check if GPU power info extraction is enabled
+    if args.powerinfo:
+        power_info = get_gpu_power_info()
 
     # Run NCCL tests if the path is provided
     if args.nccl_test_path:
@@ -434,7 +503,7 @@ def main():
         )
 
     # Write combined results to CSV
-    write_combined_results(hostname, gpu_model, results, vbios_versions, bandwidth_results, p2p_results)
+    write_combined_results(hostname, gpu_model, results, vbios_versions, bandwidth_results, p2p_results, power_info)
 
 
 if __name__ == "__main__":

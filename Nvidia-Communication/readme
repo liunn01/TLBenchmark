@@ -77,7 +77,7 @@
 	运行以下命令，测试所有功能：
 
 	```bash
-	python3 nccl-bandwitch-p2p.py \
+	python3 nccl.py \
  	   --nccl-test-path /path/to/nccl-tests/ \
   	  --bandwidth-test-path /path/to/bandwidthTest \
   	  --p2pBandwidthLatencyTest-path /path/to/p2pBandwidthLatencyTest \
@@ -85,9 +85,9 @@
     	--device=all --mode=range --start=64000000 --end=256000000 --increment=32000000 \
   	  --vbios
 	```
+	或者 使用默认路径，命令如下：Nvidia-Communication.tar.gz解压出来即可使用
+        python nccl-bandwitch-p2p.py  -b 1G -e 8G -f 2 -g 8      --device=all --mode=range --start=64000000 --end=256000000 --increment=32000000        --vbios --powerinfo
 
-     或者 使用默认路径，命令如下：Nvidia-Communication.tar.gz解压出来即可使用
-     python nccl-bandwitch-p2p.py  -b 1G -e 8G -f 2 -g 8      --device=all --mode=range --start=64000000 --end=256000000 --increment=32000000        --vbios --powerinfo
 
 2、参数说明
 
