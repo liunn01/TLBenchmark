@@ -1,3 +1,5 @@
+# --- START OF FILE vLLM-Performance.py ---
+
 import os
 import sys
 import time
@@ -6,709 +8,624 @@ import subprocess
 import requests
 import threading
 import argparse
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime
 import psutil
 import random
 import csv
 
-# Force the use of a non-graphical backend
+# 强制使用非图形后端以避免在无头服务器上出错
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Function to parse command line arguments
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='GPU Performance Benchmark Tool')
-    
-    # Server configuration
-    parser.add_argument('--model', type=str, default="/local/models/DeepSeek-R1-Distill-Llama-8B",
-                        help='Path to the model (default: %(default)s)')
-    parser.add_argument('--host', type=str, default="0.0.0.0",  # 修改默认值为 0.0.0.0
-                        help='Host to run the server on (default: %(default)s)')
-    parser.add_argument('--port', type=int, default=8335,
-                        help='Port to run the server on (default: %(default)s)')
-    parser.add_argument('--gpu', type=str, default="0",
-                        help='GPU device IDs to use (comma-separated) (default: %(default)s)')
-    parser.add_argument('--tensor-parallel-size', type=int, default=1,
-                        help='Tensor parallelism size (default: %(default)s)')
-    parser.add_argument('--data-parallel-size', type=int, default=1,
-                        help='Data parallelism size (default: %(default)s)')
-    parser.add_argument('--max-num-batched-tokens', type=int, default=131072,  # 修改默认值为 131072
-                        help='Maximum number of batched tokens (default: %(default)s)')
-    parser.add_argument('--max_num_seqs', type=int, default=256,
-                        help='Maximum number of sequences in a batch (default: %(default)s)')
-    
-    # Benchmark configuration
-    parser.add_argument('--random-input-len', type=int, default=20,
-                        help='Length of random input tokens (default: %(default)s)')
-    parser.add_argument('--random-output-len', type=int, default=20,
-                        help='Length of random output tokens (default: %(default)s)')
-    parser.add_argument('--concurrency-levels', type=str, default="4,8,16,32,64,128,256",
-                        help='Concurrency levels to test (comma-separated) (default: %(default)s)')
-    parser.add_argument('--prompts-multiplier', type=int, default=5,
-                        help='Multiplier for number of prompts relative to concurrency (default: %(default)s)')
-    parser.add_argument('--log-dir', type=str, default="./benchmark_logs",
-                        help='Directory for logs (default: %(default)s)')
-    parser.add_argument('--trust-remote-code', action='store_true',
-                        help='Trust remote code when loading models (default: %(default)s)')
-    
-    return parser.parse_args()
+# 全局变量，用于在不同函数间共享命令行参数
+args: Optional[argparse.Namespace] = None
+# 全局 benchmark_summary_log_file 变量，以便 run_benchmark 可以访问 (用于记录客户端错误)
+benchmark_summary_log_file: Optional[str] = None
 
-class ProcessManager:
-    """Process management class, responsible for starting, monitoring, and cleaning up processes"""
+
+# 函数：解析命令行参数
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='vLLM GPU 性能基准测试工具',
+        add_help=False 
+    )
+    class CustomHelpAction(argparse.Action):
+        def __init__(self, option_strings, dest=argparse.SUPPRESS, default=argparse.SUPPRESS, help=None):
+            super(CustomHelpAction, self).__init__(option_strings=option_strings, dest=dest, default=default, nargs=0, help=help)
+        def __call__(self, parser, namespace, values, option_string=None):
+            parser.print_help()
+            print("\n--- 要查看 vLLM 服务器选项, 请运行: vllm serve --help ---")
+            print("--- 要查看 vLLM 基准测试客户端选项, 请运行: vllm bench serve --help ---")
+            parser.exit()
+    parser.add_argument('-h', '--help', action=CustomHelpAction, help='显示此帮助信息并退出, 同时提示 vLLM 相关命令的帮助信息获取方式.')
+    server_group = parser.add_argument_group('服务器配置 (传递给 "vllm serve")')
+    server_group.add_argument('--model', type=str, required=True, help='模型的路径或 HuggingFace ID。此为必需参数。')
+    server_group.add_argument('--host', type=str, default="0.0.0.0", help='vLLM 服务器运行的主机 (默认: %(default)s)')
+    server_group.add_argument('--port', type=int, default=8335, help='vLLM 服务器运行的端口 (默认: %(default)s)')
+    server_group.add_argument('--gpu', type=str, default="0", help='要使用的 GPU 设备 ID (逗号分隔) (默认: %(default)s)')
+    server_group.add_argument('--tensor-parallel-size', '-tp', type=int, default=1, help='张量并行大小 (默认: %(default)s)')
+    server_group.add_argument('--data-parallel-size', '-dp', type=int, default=None, help='数据并行大小。(默认: vLLM 默认)')
+    server_group.add_argument('--max-num-batched-tokens', type=int, help='服务器最大批处理 token 数 (默认: vLLM 模型配置)', default=argparse.SUPPRESS)
+    server_group.add_argument('--max-num-seqs', type=int, default=256, help='服务器批处理中最大序列数 (默认: %(default)s)')
+    server_group.add_argument('--trust-remote-code', action='store_true', help='加载模型时信任远程代码 (默认: %(default)s)')
+    server_group.add_argument('--enable-expert-parallel', action='store_true', help='为 MoE 模型启用专家并行 (默认: %(default)s)')
+    server_group.add_argument('--no-enable-chunked-prefill', action='store_true', help='如果指定，则禁用 chunked prefill 功能。')
+    server_group.add_argument('--no-enable-prefix-caching', action='store_true', help='如果指定，则禁用 prefix caching 功能。')
     
+    client_group = parser.add_argument_group('基准测试客户端配置 (传递给 "vllm bench serve")')
+    client_group.add_argument('--random-input-len', type=int, default=200, help='随机输入 token 的长度 (默认: %(default)s)')
+    client_group.add_argument('--random-output-len', type=int, default=2000, help='请求的随机输出 token 长度 (默认: %(default)s)')
+    client_group.add_argument('--concurrency-levels', type=str, default="4,8,16,32,64,128,256", help='要测试的并发级别 (逗号分隔) (默认: %(default)s)')
+    client_group.add_argument('--prompts-multiplier', type=int, default=5, help='提示数量乘数 (默认: %(default)s)')
+    
+    general_group = parser.add_argument_group('通用脚本配置')
+    general_group.add_argument('--log-dir', type=str, default="./benchmark_logs", help='所有日志和结果的存放目录 (默认: %(default)s)')
+
+    parsed_args = parser.parse_args()
+    if not parsed_args.model: parser.error("--model 参数是必需的。")
+    parsed_args.inferred_log_model_name = os.path.basename(parsed_args.model)
+    print(f"提示: API服务名将由 'vllm serve' 从模型路径 '{parsed_args.model}' 推断 (通常为: '{parsed_args.inferred_log_model_name}')。")
+    print(f"提示: 'vllm bench serve' 将使用 '{parsed_args.model}' 作为其 --model 参数。")
+    return parsed_args
+
+# 类：进程管理器
+class ProcessManager:
     def __init__(self):
         self.processes: List[subprocess.Popen] = []
         self.log_threads: List[threading.Thread] = []
         self._register_signals()
-    
+
     def _register_signals(self):
-        """Register signal handlers"""
         signal.signal(signal.SIGINT, self.cleanup)
         signal.signal(signal.SIGTERM, self.cleanup)
-    
-    def start_process(self, cmd: List[str], log_file: str, prefix: str = "") -> subprocess.Popen:
-        """Start a process and set up log redirection"""
-        # Ensure log directory exists
+
+    def start_process(self, cmd_list: List[str], log_file: str, prefix: str = "") -> subprocess.Popen:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        
-        # Start the process
+        command_string = " ".join(cmd_list)
         proc = subprocess.Popen(
-            " ".join(cmd),
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
+            command_string, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding='utf-8', errors='replace'
         )
         self.processes.append(proc)
-        print(f"Started process: PID={proc.pid}, CMD={' '.join(cmd)}")
-        
-        # Start log recording thread
+        print(f"已启动进程: PID={proc.pid}, 命令={command_string}")
         def log_worker():
             try:
-                with open(log_file, "a") as f:  # Use append mode
-                    while proc.poll() is None:  # Check if the process has exited
+                with open(log_file, "a", encoding='utf-8') as f:
+                    while True:
+                        if proc.stdout is None: break
                         line = proc.stdout.readline()
+                        if not line and proc.poll() is not None: break
                         if line:
                             output = f"[{prefix}] {line.strip()}"
                             print(output)
                             f.write(f"{datetime.now().isoformat()} {output}\n")
-            except Exception as e:
-                print(f"Error in log worker: {e}")
-        
+                        elif proc.poll() is not None: time.sleep(0.01)
+            except Exception as e: print(f"日志工作线程 '{prefix}' 出错: {e}")
         log_thread = threading.Thread(target=log_worker, daemon=True)
         log_thread.start()
         self.log_threads.append(log_thread)
-        
         return proc
-    
+
     def cleanup(self, signum=None, frame=None):
-        """Clean up all processes"""
-        print("\n[Cleanup] Terminating processes...")
-        
-        # Track cleanup success
+        global args
+        print("\n[清理] 正在终止进程...")
         cleanup_success = True
-        
-        # Terminate child processes
-        for proc in self.processes:
+        for proc_obj in self.processes:
             try:
-                if not proc or proc.poll() is not None:
-                    continue  # Skip if process is not running
-                    
-                print(f"Terminating process: PID={proc.pid}")
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                    print(f"Process {proc.pid} terminated successfully")
+                if not proc_obj or proc_obj.poll() is not None: continue
+                print(f"正在终止进程: PID={proc_obj.pid}")
+                if proc_obj.stdout:
+                    try: proc_obj.stdout.close()
+                    except: pass
+                proc_obj.terminate()
+                try: proc_obj.wait(timeout=5); print(f"进程 {proc_obj.pid} 已成功终止。")
                 except subprocess.TimeoutExpired:
-                    print(f"Process {proc.pid} did not terminate, sending SIGKILL")
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=2)
-                        print(f"Process {proc.pid} killed successfully")
-                    except subprocess.TimeoutExpired:
-                        print(f"Failed to kill process {proc.pid}")
-                        cleanup_success = False
-            except (ProcessLookupError, AttributeError) as e:
-                print(f"Process already gone: {e}")
-            except Exception as e:
-                print(f"Error terminating process: {e}")
-                cleanup_success = False
-            finally:
-                if proc and proc.stdout:
-                    proc.stdout.close()  # Ensure resources are released
+                    print(f"进程 {proc_obj.pid} 未在5秒内终止，发送 SIGKILL...")
+                    proc_obj.kill()
+                    try: proc_obj.wait(timeout=2); print(f"进程 {proc_obj.pid} 已成功杀死。")
+                    except subprocess.TimeoutExpired: print(f"错误: 未能杀死进程 {proc_obj.pid}。"); cleanup_success = False
+            except (ProcessLookupError, AttributeError): pass
+            except Exception as e: print(f"终止进程 {proc_obj.pid if proc_obj else 'N/A'} 时出错: {e}"); cleanup_success = False
         
-        # Clean up remaining processes with more robust methods
-        try:
-            # Force terminate child processes
-            for proc in self.processes:
-                try:
-                    if proc and proc.pid and psutil.pid_exists(proc.pid):
-                        parent = psutil.Process(proc.pid)
-                        children = parent.children(recursive=True)  # Get all child processes
-                        for child in children:
-                            try:
-                                print(f"Force killing child process: PID={child.pid}")
-                                child.kill()
-                            except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                                print(f"Error killing child process {child.pid}: {e}")
-                except (psutil.NoSuchProcess, AttributeError):
-                    pass
-                except Exception as e:
-                    print(f"Error in child process cleanup: {e}")
-                    cleanup_success = False
-        except Exception as e:
-            print(f"Error cleaning up child processes: {e}")
-            cleanup_success = False
-            
-        try:
-            self._kill_zombie_processes()
-        except Exception as e:
-            print(f"Error in zombie process cleanup: {e}")
-            cleanup_success = False
-            
-        try:
-            self._kill_process_by_port(args.port)  # Kill process by port
-        except Exception as e:
-            print(f"Error in port process cleanup: {e}")
-            cleanup_success = False
-            
-        try:
-            self._kill_vllm_main_process(args.port)  # Kill vLLM main process by port
-        except Exception as e:
-            print(f"Error in vLLM main process cleanup: {e}")
-            cleanup_success = False
-            
-        try:
-            self._kill_gpu_processes()
-        except Exception as e:
-            print(f"Error in GPU process cleanup: {e}")
-            cleanup_success = False
-            
-        print("[Cleanup] " + ("Completed successfully" if cleanup_success else "Completed with errors"))
-        
-        # Ensure program exit
-        sys.exit(0)
-    
+        if args:
+            try: self._kill_zombie_processes()
+            except Exception as e: print(f"清理僵尸进程时出错: {e}"); cleanup_success = False
+            try: self._kill_process_by_port(args.port)
+            except Exception as e: print(f"通过端口清理进程时出错: {e}"); cleanup_success = False
+            try: self._kill_gpu_processes()
+            except Exception as e: print(f"清理 GPU 进程时出错: {e}"); cleanup_success = False
+        else: print("[清理] 警告: 全局 'args' 未初始化，跳过部分 psutil 清理步骤。")
+        status_message = "成功完成" if cleanup_success else "完成但有错误"
+        print(f"[清理] {status_message}。")
+        sys.exit(0 if cleanup_success else 1)
+
     def _kill_zombie_processes(self):
-        """Clean up remaining Python processes"""
-        zombie_count = 0
-        error_count = 0
-        
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        zombie_count = 0; error_count = 0; current_pid = os.getpid(); script_name = os.path.basename(__file__)
+        for proc_info_obj in psutil.process_iter(['pid', 'name', 'cmdline']):
             try:
-                if 'python' in proc.info['name'].lower():
-                    if 'cmdline' in proc.info and proc.info['cmdline']:
-                        cmdline = ' '.join(proc.info['cmdline'])
-                        if 'vllm' in cmdline or 'benchmark_serving' in cmdline:
-                            print(f"Force killing zombie process: PID={proc.info['pid']}, CMD={cmdline}")
-                            proc.kill()
-                            zombie_count += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            except Exception as e:
-                print(f"Error killing zombie process: {e}")
-                error_count += 1
-                
-        print(f"Zombie process cleanup: {zombie_count} processes killed, {error_count} errors")
-    
+                if proc_info_obj.info['pid'] == current_pid: continue
+                if 'python' in proc_info_obj.info['name'].lower():
+                    cmdline = proc_info_obj.info.get('cmdline')
+                    if cmdline and ('vllm' in ' '.join(cmdline) or script_name in ' '.join(cmdline)):
+                        print(f"强制杀死僵尸/相关 Python 进程: PID={proc_info_obj.info['pid']}, 命令={' '.join(cmdline)}")
+                        psutil.Process(proc_info_obj.info['pid']).kill(); zombie_count += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess): continue
+            except Exception as e: print(f"杀死僵尸进程 PID {proc_info_obj.info.get('pid', 'N/A')} 时出错: {e}"); error_count += 1
+        print(f"僵尸/相关进程清理: {zombie_count} 个进程被杀死, {error_count} 个错误。")
+
     def _kill_process_by_port(self, port: int):
-        """Find and terminate processes by port"""
-        found = False
+        found_killed = 0; current_pid = os.getpid()
         try:
             for conn in psutil.net_connections(kind='inet'):
                 if conn.status == psutil.CONN_LISTEN and conn.laddr.port == port:
-                    pid = conn.pid
-                    if pid:
+                    if conn.pid and conn.pid != current_pid:
                         try:
-                            proc = psutil.Process(pid)
-                            print(f"Killing process listening on port {port}: PID={pid}, Name={proc.name()}")
-                            proc.kill()
-                            found = True
-                            print(f"Successfully killed process on port {port}")
-                        except psutil.NoSuchProcess:
-                            print(f"Process {pid} on port {port} no longer exists")
-                        except Exception as e:
-                            print(f"Error killing process {pid} on port {port}: {e}")
-            
-            if not found:
-                print(f"No process found listening on port {port}")
-                
-        except Exception as e:
-            print(f"Failed to search for processes on port {port}: {e}")
+                            proc_to_kill = psutil.Process(conn.pid)
+                            print(f"正在通过端口 {port} 杀死进程: PID={conn.pid}, 名称={proc_to_kill.name()}")
+                            proc_to_kill.kill(); found_killed +=1; print(f"已成功杀死 PID {conn.pid} (端口 {port})。")
+                        except psutil.NoSuchProcess: print(f"端口 {port} 上的进程 PID {conn.pid} 已不存在。")
+                        except Exception as e: print(f"通过端口 {port} 杀死进程 PID {conn.pid} 时出错: {e}")
+            if found_killed == 0: print(f"未发现在端口 {port} 上监听的活动进程可供杀死 (已排除当前脚本自身)。")
+        except Exception as e: print(f"搜索/杀死端口 {port} 上的进程时失败: {e}")
     
-    def _kill_vllm_main_process(self, port: int):
-        """Find and kill vLLM serve main process by port"""
-        try:
-            for conn in psutil.net_connections(kind='inet'):
-                if conn.status == psutil.CONN_LISTEN and conn.laddr.port == port:
-                    pid = conn.pid
-                    if pid:
-                        try:
-                            proc = psutil.Process(pid)
-                            print(f"Killing vllm serve main process: PID={pid}, Name={proc.name()}")
-                            
-                            # Get children before killing parent
-                            children = []
-                            try:
-                                children = proc.children(recursive=True)
-                            except Exception as e:
-                                print(f"Error getting children of process {pid}: {e}")
-                            
-                            # Terminate child processes recursively
-                            for child in children:
-                                try:
-                                    print(f"Killing child process: PID={child.pid}, Name={child.name()}")
-                                    child.kill()
-                                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                                    print(f"Error killing child {child.pid}: {e}")
-                                    
-                            # Kill parent process
-                            proc.kill()
-                            print(f"Successfully killed vLLM main process PID={pid}")
-                            return
-                        except psutil.NoSuchProcess:
-                            print(f"vLLM process {pid} no longer exists")
-                        except Exception as e:
-                            print(f"Error killing vLLM process {pid}: {e}")
-            
-            print("No vLLM main process found on specified port")
-        except Exception as e:
-            print(f"Failed to search for vLLM main process on port {e}")
-    
+    def _kill_vllm_main_process(self, port: int): pass
+
     def _kill_gpu_processes(self):
-        """Find and terminate processes using the GPU through nvidia-smi"""
         try:
-            # Use nvidia-smi to find processes using GPUs
-            output = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"])
-            pids = output.decode().strip().split('\n')
-            
-            if not pids or (len(pids) == 1 and not pids[0].strip()):
-                print("No GPU processes found")
-                return
-                
-            killed_count = 0
-            error_count = 0
-            
-            for pid in pids:
-                if pid.strip():
+            output = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits"])
+            pids_str_list = output.decode().strip().split('\n')
+            if not pids_str_list or not pids_str_list[0]: print("nvidia-smi 未报告活动的 GPU 进程。"); return
+            killed_count = 0; error_count = 0; current_pid = os.getpid()
+            for pid_str in pids_str_list:
+                pid_str = pid_str.strip()
+                if pid_str:
                     try:
-                        pid = int(pid.strip())
-                        proc = psutil.Process(pid)
-                        proc_name = proc.name()
-                        print(f"Force killing GPU process: PID={pid}, Name={proc_name}")
-                        proc.kill()
-                        killed_count += 1
-                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                        print(f"Cannot kill GPU process {pid}: {e}")
-                        error_count += 1
-                    except ValueError as e:
-                        print(f"Invalid PID format: {pid}")
-                        error_count += 1
-                    except Exception as e:
-                        print(f"Error killing GPU process {pid}: {e}")
-                        error_count += 1
-            
-            print(f"GPU process cleanup: {killed_count} processes killed, {error_count} errors")
-        except subprocess.CalledProcessError as e:
-            print(f"nvidia-smi command failed: {e}")
-        except FileNotFoundError:
-            print("nvidia-smi command not found. NVIDIA drivers may not be installed.")
-        except Exception as e:
-            print(f"Failed to kill GPU processes: {e}")
+                        pid_val = int(pid_str)
+                        if pid_val == current_pid: continue
+                        proc_gpu = psutil.Process(pid_val)
+                        print(f"强制杀死 GPU 进程: PID={pid_val}, 名称={proc_gpu.name()}")
+                        proc_gpu.kill(); killed_count += 1
+                    except ValueError: print(f"来自 nvidia-smi 的 PID 格式无效: '{pid_str}'"); error_count += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied): error_count += 1
+                    except Exception as e: print(f"杀死 GPU 进程 PID {pid_val} 时出错: {e}"); error_count += 1
+            print(f"GPU 进程清理: {killed_count} 个进程被杀死, {error_count} 个错误。")
+        except subprocess.CalledProcessError: print(f"nvidia-smi 命令失败。是否已安装并在 PATH 中?")
+        except FileNotFoundError: print("未找到 nvidia-smi 命令。NVIDIA 驱动/CUDA 工具包可能未正确安装。")
+        except Exception as e: print(f"杀死 GPU 进程时发生一般错误: {e}")
 
+# 函数：等待服务器启动
 def wait_for_server(host: str, port: int, timeout: int = 600) -> bool:
-    """Wait for server to start"""
-    print(f"Waiting for server on {host}:{port}...")
-    start_time = time.time()
-    last_print = 0
-    
+    print(f"正在等待服务器 {host}:{port} 启动...")
+    start_time = time.time(); last_print_time = start_time
+    health_url = f"http://{host}:{port}/health"; completions_url = f"http://{host}:{port}/v1/completions"
     while time.time() - start_time < timeout:
+        health_ok, completions_active = False, False
+        health_code, completions_code = "N/A", "N/A"
         try:
-            response = requests.get(
-                f"http://{host}:{port}/v1/completions",
-                timeout=5
-            )
-            if response.status_code == 405:
-                print("\nServer is ready!")
-                return True
-        except (requests.ConnectionError, requests.Timeout):
-            if time.time() - last_print > 30:
-                print(". ", end="", flush=True)
-                last_print = time.time()
-            time.sleep(1)
-        except Exception as e:
-            print(f"\nError checking server status: {str(e)}")
-            break
-    return False
+            hr = requests.get(health_url, timeout=2); health_code = hr.status_code
+            if health_code == 200:
+                health_ok = True
+                try:
+                    cr = requests.get(completions_url, timeout=2); completions_code = cr.status_code
+                    if completions_code == 405: completions_active = True
+                except: pass
+            if health_ok and completions_active:
+                print(f"\n服务器已就绪 (/health: {health_code}, /v1/completions: {completions_code})!"); return True
+        except: pass
+        if time.time() - last_print_time > 30: print(". ", end="", flush=True); last_print_time = time.time()
+        time.sleep(2)
+    print(f"\n服务器在 {host}:{port} 未在 {timeout} 秒内完全就绪 (health: {health_code}, completions: {completions_code})。"); return False
 
-def run_benchmark(pm: ProcessManager, config: dict, log_file: str):
-    """Execute benchmark test"""
-    cmd = [
-        "vllm bench serve",
+# 函数：执行基准测试 (客户端)
+def run_benchmark(pm_unused: ProcessManager, config: dict, summary_log_for_errors: str):
+    global args
+    if not args or not args.model:
+        print("错误 (run_benchmark): 全局 'args.model' (模型路径/ID) 未设置。")
+        return {"MaxConcurrency": str(config['concurrency']), "Error": "args.model 未定义"}
+
+    model_identifier_for_client = args.model
+
+    bench_client_cmd_list = [
+        "vllm", "bench", "serve",
+        "--model", model_identifier_for_client,
+        "--endpoint", "/v1/completions",
+        "--host", config['host'],
+        "--port", str(config['port']),
         "--dataset-name", "random",
         "--random-input-len", str(config['input_len']),
         "--random-output-len", str(config['output_len']),
-        "--model", config['model'],
-        "--host", config['host'],
-        "--port", str(config['port']),
         "--num-prompts", str(config['num_prompts']),
         "--seed", str(config['seed']),
         "--max-concurrency", str(config['concurrency'])
     ]
-    
-    # Define regex patterns for lines to keep
+    if args.trust_remote_code:
+        bench_client_cmd_list.append("--trust-remote-code")
+
     grep_patterns = [
-        "Maximum request concurrency:",
-        r"Successful requests:\s+[0-9]+",
-        r"Benchmark duration \(s\):\s+[0-9.]+",
-        r"Request throughput \(req/s\):\s+[0-9.]+",
+        "Maximum request concurrency:", r"Successful requests:\s+[0-9]+",
+        r"Benchmark duration \(s\):\s+[0-9.]+", r"Request throughput \(req/s\):\s+[0-9.]+",
         r"Output token throughput \(tok/s\):\s+[0-9.]+",
         r"Total Token throughput \(tok/s\):\s+[0-9.]+",
-        r"Median TTFT \(ms\):\s+[0-9.]+",
-        r"Median TPOT \(ms\):\s+[0-9.]+"
+        r"Median TTFT \(ms\):\s+[0-9.]+", r"Median TPOT \(ms\):\s+[0-9.]+"
     ]
+    grep_cmd_str = "grep -E --color=never '" + "|".join(grep_patterns) + "'"
     
-    # Construct filter command
-    grep_cmd = " | ".join([
-        " ".join(cmd),
-        "grep -E --color=never '" + "|".join(grep_patterns) + "'"
-    ])
-    
-    print(f"Running benchmark with concurrency={config['concurrency']}")
-    print(f"Command: {grep_cmd}")
-    
-    try:
-        # Execute the filtered command directly with subprocess
-        proc = subprocess.Popen(
-            grep_cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        stdout, stderr = proc.communicate()
-        
-        if proc.returncode != 0:
-            error_msg = f"Benchmark failed with exit code {proc.returncode}"
-            if stderr:
-                error_msg += f": {stderr}"
-            print(error_msg)
-            raise RuntimeError(error_msg)
-        
-        if not stdout.strip():
-            print("Warning: Benchmark returned empty results")
-            return {"MaxConcurrency": str(config['concurrency']), "Error": "Empty results"}
-        
-        # Parse and format output
-        results = parse_benchmark_output(stdout)
-        
-        # Add concurrency level if not in results
-        if "MaxConcurrency" not in results:
-            results["MaxConcurrency"] = str(config['concurrency'])
-            
-        return results  # Return parsed results
-    except subprocess.SubprocessError as e:
-        print(f"Subprocess error during benchmark: {e}")
-        return {"MaxConcurrency": str(config['concurrency']), "Error": str(e)}
-    except Exception as e:
-        print(f"Error during benchmark with concurrency={config['concurrency']}: {e}")
-        return {"MaxConcurrency": str(config['concurrency']), "Error": str(e)}
+    env_vars_prefix = ""
+    # env_vars_prefix = "HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
 
+    full_bench_client_command_str = env_vars_prefix + " ".join(bench_client_cmd_list) + " | " + grep_cmd_str
+
+    print(f"正在为并发级别 {config['concurrency']} 运行基准测试客户端")
+    print(f"客户端命令 (内部参数): {' '.join(bench_client_cmd_list)}")
+    print(f"完整执行命令: {full_bench_client_command_str}")
+
+    try:
+        proc_bench = subprocess.Popen(
+            full_bench_client_command_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace'
+        )
+        stdout, stderr = proc_bench.communicate()
+
+        if proc_bench.returncode != 0:
+            error_msg = f"基准测试客户端失败 (退出码 {proc_bench.returncode})"
+            detailed_error = stderr.strip() if stderr else "无详细错误信息"
+            if detailed_error: error_msg += f": {detailed_error}"
+            print(error_msg)
+            if summary_log_for_errors: 
+                with open(summary_log_for_errors, "a", encoding='utf-8') as f_err_log:
+                     f_err_log.write(f"\n--- Client Error (Concurrency: {config['concurrency']}) ---\n{detailed_error}\n------------------------------------\n")
+            return {"MaxConcurrency": str(config['concurrency']), "Error": f"基准测试客户端失败: {detailed_error}"}
+
+        if not stdout.strip():
+            print("警告: 基准测试客户端在 grep 后返回空结果。")
+            return {"MaxConcurrency": str(config['concurrency']), "Error": "基准测试客户端返回空结果"}
+
+        results = parse_benchmark_output(stdout)
+        if "MaxConcurrency" not in results: 
+            results["MaxConcurrency"] = str(config['concurrency'])
+        return results
+    except subprocess.SubprocessError as e:
+        print(f"执行基准测试客户端时发生子进程错误: {e}"); return {"MaxConcurrency": str(config['concurrency']), "Error": str(e)}
+    except Exception as e:
+        print(f"执行基准测试客户端时出错 (并发级别={config['concurrency']}): {e}"); return {"MaxConcurrency": str(config['concurrency']), "Error": str(e)}
+
+# 函数：解析基准测试输出 (使用英文键名)
 def parse_benchmark_output(output: str) -> dict:
-    """Parse benchmark test output"""
     results = {}
+    patterns = {
+        "MaxConcurrency": "Maximum request concurrency",
+        "SuccessRequests": "Successful requests",
+        "RequestThroughput": "Request throughput (req/s)",
+        "OutputTokenThroughput": "Output token throughput (tok/s)", 
+        "TotalTokenThroughput": "Total Token throughput (tok/s)", 
+        "TTFT": "Median TTFT (ms)", 
+        "TPOT": "Median TPOT (ms)"
+    }
     for line in output.splitlines():
-        if "Maximum request concurrency:" in line:
-            results["MaxConcurrency"] = line.split(":")[1].strip()
-        elif "Successful requests:" in line:
-            results["SuccessRequests"] = line.split(":")[1].strip()
-        elif "Request throughput (req/s):" in line:
-            results["RequestThroughput"] = line.split(":")[1].strip()
-        elif "Output token throughput" in line:
-            results["OutputTokenThroughput"] = line.split(":")[1].strip()
-        elif "Total Token throughput" in line:
-            results["TotalTokenThroughput"] = line.split(":")[1].strip()
-        elif "Median TTFT" in line:
-            results["TTFT"] = line.split(":")[1].strip()
-        elif "Median TPOT" in line:
-            results["TPOT"] = line.split(":")[1].strip()
+        line = line.strip()
+        for key, desc_part in patterns.items():
+            if desc_part in line:
+                try:
+                    results[key] = line.split(":", 1)[1].strip()
+                    break 
+                except IndexError:
+                    print(f"警告: 解析行 '{line}' 失败，无法按 ':' 分割。")
     return results
 
-def format_benchmark_results(results: dict) -> str:
-    """Format benchmark results"""
-    header = format_benchmark_header()
-    row = format_benchmark_row(results)
-    return header + "\n" + row
+# 函数：获取GPU信息
+def get_gpu_config_string(gpu_arg: str) -> str:
+    num_gpus = 0
+    if gpu_arg: 
+        valid_gpu_ids = [gid for gid in gpu_arg.split(',') if gid.strip().isdigit()]
+        num_gpus = len(valid_gpu_ids)
+    
+    if num_gpus == 0:
+        print("警告: 未提供有效的GPU ID或GPU参数为空。GPU配置将设为 UnknownGPU*0。")
+        return "UnknownGPU*0"
 
-def format_benchmark_header() -> str:
-    """Generate title row for benchmark results"""
-    return "{:<10} {:<10} {:<10} {:<15} {:<15} {:<10} {:<10}".format(
-        "Max-Conc",  # Maximum-request-concurrency
-        "Succ-Req",  # Successful-requests
-        "Req/s",     # Request-throughput(req/s)
-        "Out-Tok/s", # Output-token-throughput(tok/s)
-        "Tot-Tok/s", # Total-Token-throughput(tok/s)
-        "TTFT",      # Median-TTFT(ms)
-        "TPOT"       # Median-TPOT(ms)
-    )
-
-def format_benchmark_row(results: dict) -> str:
-    """Generate data row for benchmark results"""
-    return "{:<10} {:<10} {:<10} {:<15} {:<15} {:<10} {:<10}".format(
-        results.get("MaxConcurrency", "N/A"),
-        results.get("SuccessRequests", "N/A"),
-        results.get("RequestThroughput", "N/A"),
-        results.get("OutputTokenThroughput", "N/A"),
-        results.get("TotalTokenThroughput", "N/A"),
-        results.get("TTFT", "N/A"),
-        results.get("TPOT", "N/A")
-    )
-
-def print_formatted_results(results: dict):
-    """Format and print benchmark results"""
-    header = [
-        "MaxConcurrency",
-        "SuccessRequests",
-        "OutputTokenThroughput",
-        "TotalTokenThroughput",
-        "TTFT",
-        "TPOT"
-    ]
-    print("\t".join(header))  # Print the header row
-    row = [
-        results.get("MaxConcurrency", "N/A"),
-        results.get("SuccessRequests", "N/A"),
-        results.get("OutputTokenThroughput", "N/A"),
-        results.get("TotalTokenThroughput", "N/A"),
-        results.get("TTFT", "N/A"),
-        results.get("TPOT", "N/A")
-    ]
-    print("\t".join(row))  # Print the data row
-
-def plot_results(results_list, output_file="benchmark_results.png"):
-    """Generate chart based on benchmark results"""
-    # Extract data
-    max_conc = [int(result["MaxConcurrency"]) for result in results_list if "MaxConcurrency" in result and "Error" not in result]
-    
-    # Skip if no valid results
-    if not max_conc:
-        print("No valid benchmark results to plot")
-        return
-        
-    req_per_sec = [float(result["RequestThroughput"]) for result in results_list if "RequestThroughput" in result]
-    out_tok_per_sec = [float(result["OutputTokenThroughput"]) for result in results_list if "OutputTokenThroughput" in result]
-    tot_tok_per_sec = [float(result["TotalTokenThroughput"]) for result in results_list if "TotalTokenThroughput" in result]
-    ttft = [float(result["TTFT"]) for result in results_list if "TTFT" in result]
-    tpot = [float(result["TPOT"]) for result in results_list if "TPOT" in result]
-    
-    # Set chart size
-    plt.figure(figsize=(10, 6))
-    
-    # Plot line graphs for each field
-    if req_per_sec: plt.plot(max_conc[:len(req_per_sec)], req_per_sec, label="Req/s", marker="o")
-    if out_tok_per_sec: plt.plot(max_conc[:len(out_tok_per_sec)], out_tok_per_sec, label="Out-Tok/s", marker="o")
-    if tot_tok_per_sec: plt.plot(max_conc[:len(tot_tok_per_sec)], tot_tok_per_sec, label="Tot-Tok/s", marker="o")
-    if ttft: plt.plot(max_conc[:len(ttft)], ttft, label="TTFT", marker="o")
-    if tpot: plt.plot(max_conc[:len(tpot)], tpot, label="TPOT", marker="o")
-    
-    # Set title and labels
-    plt.title("Benchmark Results", fontsize=16)
-    plt.xlabel("Max-Conc", fontsize=12)
-    plt.ylabel("Metrics", fontsize=12)
-    
-    # Set y-axis ticks at intervals of 200 if we have data
-    if any([req_per_sec, out_tok_per_sec, tot_tok_per_sec, ttft, tpot]):
-        max_val = max([
-            max(req_per_sec) if req_per_sec else 0,
-            max(out_tok_per_sec) if out_tok_per_sec else 0,
-            max(tot_tok_per_sec) if tot_tok_per_sec else 0,
-            max(ttft) if ttft else 0,
-            max(tpot) if tpot else 0
-        ])
-        plt.yticks(range(0, int(max_val + 200), 200))
-    
-    # Display legend
-    plt.legend()
-    
-    # Display grid
-    plt.grid(True, linestyle="-", alpha=0.6)
-    
-    # Save chart to file
+    gpu_name_short = "UnknownGPU" 
     try:
-        plt.savefig(output_file)
-        print(f"Saved benchmark results plot to {output_file}")
+        first_gpu_id_str = valid_gpu_ids[0] 
+
+        command = ["nvidia-smi", f"--query-gpu=name", f"--id={first_gpu_id_str}", "--format=csv,noheader,nounits"]
+        # print(f"DEBUG: 正在执行 nvidia-smi 命令: {' '.join(command)}") 
+
+        result = subprocess.run(
+            command,
+            capture_output=True, text=True, check=True, encoding='utf-8'
+        )
+        gpu_name_full = result.stdout.strip()
+        # print(f"DEBUG: nvidia-smi --query-gpu=name 的原始输出: '{gpu_name_full}'")
+
+        if not gpu_name_full:
+            print("警告: nvidia-smi 返回了空的 GPU 名称。")
+            gpu_name_short = "EmptyName"
+        else:
+            name_to_parse = gpu_name_full
+            prefixes_to_remove = ["NVIDIA Corporation", "NVIDIA", "AMD", "Advanced Micro Devices, Inc."] # 可根据需要添加更多
+            for prefix in prefixes_to_remove:
+                if name_to_parse.upper().startswith(prefix.upper()):
+                    name_to_parse = name_to_parse[len(prefix):].strip()
+            
+            parts = name_to_parse.split()
+            if parts:
+                model_keywords = ["L4", "L20", "L40", "A30", "A40", "A100", "H100", "V100", 
+                                  "RTX", "TITAN", "QUADRO", 
+                                  "MI50", "MI100", "MI210", "MI250", "MI300"] 
+                
+                found_specific_model = False
+                for i, part in enumerate(parts): # 从前往后，方便组合 "RTX" + "4090"
+                    # 清理单个部分，去除可能的尾部修饰符，例如 "4090Ti" -> "4090" (简单处理)
+                    # current_part_cleaned = part.upper().replace("TI", "").replace("SUPER", "")
+                    current_part_cleaned = part # 暂时不清理part内部
+
+                    is_model_like = any(char.isdigit() for char in current_part_cleaned) or \
+                                    any(current_part_cleaned.upper().startswith(kw) for kw in model_keywords)
+                    
+                    if is_model_like:
+                        gpu_name_short = part # 先取当前部分
+                        # 尝试向后组合，比如 "RTX" + "4090" 或者 "L40" + "S"
+                        if (part.upper() == "RTX" or part.upper().startswith("L")) and i + 1 < len(parts):
+                            next_part = parts[i+1]
+                            # 如果下一个部分是数字开头，或者对L系列是S
+                            if next_part[0].isdigit() or (part.upper().startswith("L") and next_part.upper() == "S"):
+                                gpu_name_short += "" + next_part # 可以用 " " 或 "" 连接
+                        found_specific_model = True
+                        break 
+                
+                if not found_specific_model: # 如果上面的精确匹配没找到
+                    # 选择最后一个非品牌词 (如果还存在品牌词的话，虽然我们已经移除了前缀)
+                    # 或者就用清理后的第一个词
+                    non_brand_parts = [p for p in parts if p.upper() not in [b.upper() for b in prefixes_to_remove]]
+                    if non_brand_parts:
+                        gpu_name_short = non_brand_parts[0] # 取第一个非品牌词
+                    elif parts : # 如果都是品牌词 (不太可能)，或只有一个词
+                        gpu_name_short = parts[0] 
+                    else: # name_to_parse 为空
+                        gpu_name_short = "Unnamed"
+
+
+            else: # 如果 name_to_parse 为空 (例如原名就是 "NVIDIA")
+                 gpu_name_short = gpu_name_full.split()[-1] if gpu_name_full.split() else "UnknownSplit"
+        
+        # print(f"DEBUG: 提取的 GPU 简称: '{gpu_name_short}'")
+
+    except FileNotFoundError:
+        print("警告: 未找到 nvidia-smi 命令。GPU 型号将为未知。")
+        gpu_name_short = "NvidiaSMINotFound"
+    except ValueError as ve: 
+        print(f"警告: GPU 参数或ID无效: {ve}。GPU 型号将为未知。")
+        gpu_name_short = "InvalidGPU_ID"
+    except subprocess.CalledProcessError as e:
+        print(f"警告: 执行 nvidia-smi 失败 (返回码 {e.returncode})。GPU 型号将为未知。")
+        if e.stdout: print(f"nvidia-smi stdout: {e.stdout.strip()}")
+        if e.stderr: print(f"nvidia-smi stderr: {e.stderr.strip()}")
+        gpu_name_short = "NvidiaSMIError"    
     except Exception as e:
-        print(f"Error saving plot: {e}")
-    
-    # Don't include plt.show() to avoid attempting to display in a command-line environment
+        print(f"警告: 获取 GPU 型号时发生未知错误: {e}。GPU 型号将为未知。")
+        import traceback
+        traceback.print_exc()
+        gpu_name_short = "GPUFetchError"
+            
+    return f"{gpu_name_short}*{num_gpus}"
 
-def main():
-    global args
-    
+# 函数：绘制基准测试结果图表
+def plot_results(results_list, output_file="benchmark_results.png"):
+    valid_results = [r for r in results_list if r and "Error" not in r]
+    if not valid_results: print("没有有效的基准测试结果可供绘制。"); return
     try:
-        # Parse command line arguments
+        results_by_concurrency = {}
+        for r_item in valid_results:
+            if "MaxConcurrency" in r_item and isinstance(r_item["MaxConcurrency"], str) and r_item["MaxConcurrency"].strip().isdigit():
+                mc_val = int(r_item["MaxConcurrency"])
+                if mc_val not in results_by_concurrency: results_by_concurrency[mc_val] = r_item
+        sorted_concurrencies = sorted(results_by_concurrency.keys())
+        if not sorted_concurrencies: print("未找到有效的整数并发级别用于绘图。"); return
+        x_axis_for_plot = sorted_concurrencies
+        def get_metric_for_plot(key): 
+            metric_values = []
+            for mc_int in sorted_concurrencies:
+                res_dict = results_by_concurrency.get(mc_int, {}); value_str = res_dict.get(key)
+                is_numeric = False
+                if isinstance(value_str, str):
+                    temp_val = value_str.strip()
+                    if temp_val.startswith('-'): temp_val = temp_val[1:]
+                    if temp_val.replace('.', '', 1).isdigit(): is_numeric = True
+                if is_numeric: metric_values.append(float(value_str))
+                else: metric_values.append(None)
+            return metric_values
+
+        metrics_to_plot = {
+            "RequestThroughput": ("ReqThr (req/s, Higher is Better)", "o", 0),
+            "OutputTokenThroughput": ("OutTokThr (tok/s, Higher is Better)", "s", 1),
+            "TotalTokenThroughput": ("TotalTokThr (tok/s, Higher is Better)", "^", 2),
+            "TTFT": ("Median TTFT (ms, Lower is Better)", "x", 3),
+            "TPOT": ("Median TPOT (ms, Lower is Better)", "d", 4)
+        }
+        metric_data_all = {key: get_metric_for_plot(key) for key in metrics_to_plot}
+    except Exception as e: print(f"处理绘图数据时出错: {e}。跳过绘图。"); import traceback; traceback.print_exc(); return
+    
+    plt.figure(figsize=(14, 8)); plt.style.use('seaborn-v0_8-whitegrid')
+    colors = plt.cm.get_cmap('viridis', len(metrics_to_plot)) # type: ignore
+    all_y_values_for_ylim = []
+    
+    for key, (label, marker, color_idx) in metrics_to_plot.items():
+        y_data = metric_data_all.get(key) 
+        if y_data is None: continue
+
+        valid_x = [x for x, y_val in zip(x_axis_for_plot, y_data) if y_val is not None]
+        valid_y = [y_val for y_val in y_data if y_val is not None]
+        if valid_x and valid_y:
+            plt.plot(valid_x, valid_y, label=label, marker=marker, linestyle='-', linewidth=2, color=colors(color_idx))
+            all_y_values_for_ylim.extend(valid_y)
+            
+    plt.title("vLLM Benchmark Results vs Max Concurrency", fontsize=18, fontweight='bold')
+    plt.xlabel("Max Concurrency (Parallel Requests)", fontsize=14); plt.ylabel("Metric Value", fontsize=14)
+    if x_axis_for_plot: plt.xticks(x_axis_for_plot, fontsize=12)
+    plt.yticks(fontsize=12)
+    
+    if all_y_values_for_ylim:
+        min_y_val = min(all_y_values_for_ylim); max_y_val = max(all_y_values_for_ylim)
+        y_padding = 0.1 * abs(max_y_val - min_y_val) if max_y_val != min_y_val else 0.1 * abs(max_y_val if max_y_val !=0 else 1.0)
+        if y_padding == 0 : y_padding = max(1.0, abs(max_y_val * 0.1) if max_y_val != 0 else 1.0) 
+        
+        bottom_y = min_y_val - y_padding
+        top_y = max_y_val + y_padding
+        if min_y_val >= 0 : bottom_y = max(0, bottom_y) 
+        
+        if bottom_y >= top_y : top_y = bottom_y + y_padding 
+        plt.ylim(bottom=bottom_y, top=top_y)
+
+    plt.legend(fontsize=12, loc='best', frameon=True, shadow=True); plt.grid(True, linestyle=":", alpha=0.7)
+    try: plt.tight_layout(); plt.savefig(output_file, dpi=150); print(f"已将基准测试结果图表保存到 {output_file}")
+    except Exception as e_plot: print(f"保存图表时出错: {e_plot}")
+    plt.close()
+
+# 主函数
+def main():
+    global args, benchmark_summary_log_file
+    pm = None
+    try:
         args = parse_arguments()
-        
-        # Create log directories
-        log_dirs = [
-            os.path.join(args.log_dir, "vllm_server_log"),
-            os.path.join(args.log_dir, "benchmark_output_log")
-        ]
-        os.makedirs(log_dirs[0], exist_ok=True)
-        os.makedirs(log_dirs[1], exist_ok=True)
-        
-        # Initialize process manager
+        log_model_name_part = args.inferred_log_model_name.replace("/", "_").replace("\\", "_")
+
+        log_dirs = [os.path.join(args.log_dir, "vllm_server_log"), os.path.join(args.log_dir, "benchmark_output_log")]
+        os.makedirs(log_dirs[0], exist_ok=True); os.makedirs(log_dirs[1], exist_ok=True)
         pm = ProcessManager()
         
-        # Prepare log files
-        current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-        model_name = os.path.basename(args.model)  # 提取模型名称
-        csv_file = os.path.join(
-            log_dirs[1],
-            f"{model_name}-Input{args.random_input_len}-Output{args.random_output_len}-{current_time}.csv"
-        )  # CSV 文件路径
-        plot_file = os.path.join(log_dirs[1], f"benchmark-{current_time}.png")  # Chart 文件路径
-        server_log = os.path.join(log_dirs[0], f"vllm-{current_time}.log")
-        benchmark_log = os.path.join(log_dirs[1], f"benchmark-{current_time}.log")
+        current_time_date_part = datetime.now().strftime("%Y%m%d") 
+        current_time_full_ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+        base_filename_parts = [
+            log_model_name_part,
+            f"Input{args.random_input_len}",
+            f"Output{args.random_output_len}",
+            current_time_date_part 
+        ]
+        base_filename = "-".join(base_filename_parts)
+
+        csv_file_path = os.path.join(log_dirs[1], f"{base_filename}.csv")
+        plot_file = os.path.join(log_dirs[1], f"{base_filename}.png")
         
-        # Start vLLM server
-        vllm_cmd = [
-            f"CUDA_VISIBLE_DEVICES={args.gpu}",
-            "vllm", "serve", args.model,
-            "--host", args.host,
-            "--port", str(args.port),
-            "--tensor-parallel-size", str(args.tensor_parallel_size),
-            "--data-parallel-size", str(args.data_parallel_size),  # 新增参数
-            "--max-num-seqs", str(args.max_num_seqs)
+        benchmark_summary_log_file = os.path.join(log_dirs[1], f"benchmark-summary-text-{log_model_name_part}-{current_time_full_ts}.log")
+        server_log_file = os.path.join(log_dirs[0], f"vllm-server-{log_model_name_part}-{current_time_full_ts}.log")
+
+
+        vllm_server_cmd_prefix = f"CUDA_VISIBLE_DEVICES={args.gpu}"
+        vllm_server_base_cmd = [
+            "vllm", "serve", args.model, "--host", args.host, "--port", str(args.port),
+            "--tensor-parallel-size", str(args.tensor_parallel_size), "--max-num-seqs", str(args.max_num_seqs),
         ]
         
-        # Add trust-remote-code flag if specified
-        if args.trust_remote_code:
-            vllm_cmd.append("--trust-remote-code")
+        if args.data_parallel_size is not None and args.data_parallel_size > 0:
+            vllm_server_base_cmd.extend(["--data-parallel-size", str(args.data_parallel_size)])
+        if hasattr(args, "max_num_batched_tokens"):
+            vllm_server_base_cmd.extend(["--max-num-batched-tokens", str(args.max_num_batched_tokens)])
+        if args.no_enable_chunked_prefill: vllm_server_base_cmd.append("--no-enable-chunked-prefill")
+        if args.no_enable_prefix_caching: vllm_server_base_cmd.append("--no-enable-prefix-caching")
+        if args.trust_remote_code: vllm_server_base_cmd.append("--trust-remote-code")
+        if args.enable_expert_parallel: vllm_server_base_cmd.append("--enable-expert-parallel")
         
-        pm.start_process(vllm_cmd, server_log, "vLLM")
+        full_vllm_server_cmd_list = [vllm_server_cmd_prefix] + vllm_server_base_cmd
+        pm.start_process(full_vllm_server_cmd_list, server_log_file, "vLLM_Server")
+
+        if not wait_for_server(args.host, args.port, timeout=1200): print("错误: 服务器未能启动。正在退出。"); sys.exit(1)
         
-        # Wait for server to start
-        if not wait_for_server(args.host, args.port, timeout=1200):
-            raise RuntimeError("Server failed to start within timeout")
-        
-        # Write CSV file header
-        with open(csv_file, "w", newline="") as f:
-            csv_writer = csv.writer(f)
-            csv_writer.writerow([
-                "Max-Conc",  # Maximum-request-concurrency
-                "Succ-Req",  # Successful-requests
-                "Req/s",     # Request-throughput(req/s)
-                "Out-Tok/s", # Output-token-throughput(tok/s)
-                "Tot-Tok/s", # Total-Token-throughput(tok/s)
-                "TTFT",      # Median-TTFT(ms)
-                "TPOT"       # Median-TPOT(ms)
-            ])
-        
-        # Write log file header
-        with open(benchmark_log, "w") as f:
-            f.write(format_benchmark_header() + "\n")
-        
-        # Run benchmark tests
-        config = {
-            "model": args.model,
-            "host": args.host,
-            "port": args.port,
-            "input_len": args.random_input_len,
-            "output_len": args.random_output_len,
-            "num_prompts": 0,
-            "concurrency": None
+        parsed_concurrency_levels = []
+        try:
+            parsed_concurrency_levels = [int(c.strip()) for c in args.concurrency_levels.split(',') if c.strip()]
+            if not parsed_concurrency_levels: raise ValueError("并发级别列表为空。")
+        except ValueError as e_conc: print(f"错误: 无效的并发级别 '{args.concurrency_levels}'。 {e_conc}"); sys.exit(1)
+
+        csv_header_english = ["Model", "InputLen", "OutputLen", "GPUConfig", "MetricType"]
+        for conc_level in parsed_concurrency_levels:
+            csv_header_english.append(f"Conc{conc_level}")
+
+        with open(csv_file_path, "w", newline="", encoding='utf-8') as f_csv:
+            csv_writer = csv.writer(f_csv)
+            csv_writer.writerow(csv_header_english)
+
+        all_run_results_structured: Dict[str, Dict[int, Any]] = {
+            "TPOT": {}, "TTFT": {}, "OutputTokenThroughput": {}
         }
         
-        results_list = []  # Store all benchmark results
+        raw_results_for_plot = [] 
+        benchmark_client_config_base = {"host": args.host, "port": args.port, "input_len": args.random_input_len, "output_len": args.random_output_len}
         
-        # Parse concurrency levels
-        concurrency_levels = [int(c) for c in args.concurrency_levels.split(',')]
-        
-        for concurrency in concurrency_levels:
-            print(f"\n{'='*40}")
-            print(f"Starting concurrency test: {concurrency}")
-            print(f"{'='*40}")
+        for concurrency_level in parsed_concurrency_levels:
+            print(f"\n{'='*40}\n正在为并发级别 {concurrency_level} 启动基准测试客户端\n{'='*40}")
+            current_benchmark_config = benchmark_client_config_base.copy()
+            current_benchmark_config['concurrency'] = concurrency_level
+            current_benchmark_config['num_prompts'] = concurrency_level * args.prompts_multiplier
+            current_benchmark_config['seed'] = random.randint(10000, 99999)
             
-            # Generate a random seed
-            random_seed = random.randint(10000, 99999)
+            print(f"客户端使用模型标识 (用于tokenizer和API请求): '{args.model}', 随机种子: {current_benchmark_config['seed']}")
+            print(f"客户端提示数量: {current_benchmark_config['num_prompts']} ({args.prompts_multiplier}x 最大并发)")
             
-            # Update configuration
-            config['concurrency'] = concurrency
-            config['num_prompts'] = concurrency * args.prompts_multiplier  # Set num-prompts relative to concurrency
-            config['seed'] = random_seed  # Add random seed to configuration
+            single_run_results = run_benchmark(pm, current_benchmark_config, benchmark_summary_log_file)
+            raw_results_for_plot.append(single_run_results) 
             
-            print(f"Using random seed: {random_seed}")
-            print(f"Setting num-prompts to {config['num_prompts']} ({args.prompts_multiplier}x max-concurrency)")
-            
-            # Execute benchmark test
-            results = run_benchmark(pm, config, benchmark_log)
-            results_list.append(results)  # Collect results
-            
-            # Skip logging if benchmark failed
-            if "Error" in results:
-                print(f"Skipping logging for failed benchmark with concurrency={concurrency}: {results['Error']}")
+            if "Error" in single_run_results or not single_run_results:
+                error_msg = single_run_results.get("Error", "客户端未返回数据")
+                print(f"跳过记录并发级别 {concurrency_level} 的结果: {error_msg}")
+                all_run_results_structured["TPOT"][concurrency_level] = "ERROR"
+                all_run_results_structured["TTFT"][concurrency_level] = "ERROR"
+                all_run_results_structured["OutputTokenThroughput"][concurrency_level] = "ERROR"
                 continue
-                
-            # Write to log file
-            with open(benchmark_log, "a") as f:
-                f.write(format_benchmark_row(results) + "\n")
             
-            # Write to CSV file
-            with open(csv_file, "a", newline="") as f:
-                csv_writer = csv.writer(f)
-                csv_writer.writerow([
-                    results.get("MaxConcurrency", "N/A"),
-                    results.get("SuccessRequests", "N/A"),
-                    results.get("RequestThroughput", "N/A"),
-                    results.get("OutputTokenThroughput", "N/A"),
-                    results.get("TotalTokenThroughput", "N/A"),
-                    results.get("TTFT", "N/A"),
-                    results.get("TPOT", "N/A")
-                ])
+            all_run_results_structured["TPOT"][concurrency_level] = single_run_results.get("TPOT", "N/A")
+            all_run_results_structured["TTFT"][concurrency_level] = single_run_results.get("TTFT", "N/A")
+            all_run_results_structured["OutputTokenThroughput"][concurrency_level] = single_run_results.get("OutputTokenThroughput", "N/A")
+            
+            with open(benchmark_summary_log_file, "a", encoding='utf-8') as f_bench_log_data:
+                 f_bench_log_data.write(f"--- Concurrency: {concurrency_level} ---\n")
+                 for key, value in single_run_results.items():
+                     f_bench_log_data.write(f"{key}: {value}\n")
+                 f_bench_log_data.write("\n")
+
+        gpu_config_str = get_gpu_config_string(args.gpu)
+        model_name_for_csv = args.inferred_log_model_name
+
+        with open(csv_file_path, "a", newline="", encoding='utf-8') as f_csv: 
+            csv_writer = csv.writer(f_csv)
+            common_prefix = [ model_name_for_csv, args.random_input_len, args.random_output_len, gpu_config_str ]
+            
+            metric_type_map_to_csv_label = { 
+                "TPOT": "Median TPOT",
+                "TTFT": "Median TTFT",
+                "OutputTokenThroughput": "Output Throughput" 
+            }
+
+            for metric_key_internal, concurrency_data in all_run_results_structured.items():
+                metric_label_for_csv = metric_type_map_to_csv_label.get(metric_key_internal, metric_key_internal)
+                row_to_write = common_prefix + [metric_label_for_csv]
+                for conc_level in parsed_concurrency_levels:
+                    row_to_write.append(concurrency_data.get(conc_level, "N/A"))
+                csv_writer.writerow(row_to_write)
         
-        # Generate chart after benchmark tests if we have results
-        if any(["Error" not in result for result in results_list]):
-            plot_results(results_list, plot_file)
-        else:
-            print("No successful benchmark results to plot")
-            
-    except KeyboardInterrupt:
-        print("\nBenchmark interrupted by user.")
-        if 'pm' in locals():
-            pm.cleanup()
-        sys.exit(0)  # 确保程序退出
-    except Exception as e:
-        print(f"\n[Error] {str(e)}")
-        sys.exit(1)
+        print(f"新的英文CSV格式结果已保存到: {csv_file_path}")
+
+        if any("Error" not in r for r in raw_results_for_plot if r): plot_results(raw_results_for_plot, plot_file)
+        else: print("没有成功的基准测试结果可供绘制。")
+
+    except KeyboardInterrupt: print("\n基准测试被用户中断。")
+    except SystemExit as e: print(f"脚本因 SystemExit 退出 (代码: {e.code})。"); 
+    except Exception as e_main: print(f"\n[错误] main 函数中发生意外错误: {str(e_main)}"); import traceback; traceback.print_exc()
     finally:
-        try:
-            if 'pm' in locals():
-                pm.cleanup()
-        except Exception as e:
-            print(f"Error during final cleanup: {e}")
-    
-    # Check for remaining Python processes
-    try:
-        print("\n[Debug] Checking for remaining Python processes...")
-        remaining_count = 0
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                if 'python' in proc.info['name'].lower():
-                    if 'cmdline' in proc.info and proc.info['cmdline']:
-                        cmdline = ' '.join(proc.info['cmdline'])
-                        print(f"Remaining process: PID={proc.info['pid']}, CMD={cmdline}")
-                        remaining_count += 1
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        
-        if remaining_count == 0:
-            print("No remaining Python processes found.")
-    except Exception as e:
-        print(f"Error checking remaining processes: {e}")
+        print("提示: main 函数的 finally 块: 如果 pm 已初始化，尝试清理...")
+        if pm:
+            try: pm.cleanup()
+            except SystemExit as e_cleanup_exit: 
+                if e_cleanup_exit.code != 0: sys.exit(e_cleanup_exit.code) 
+            except Exception as e_final_cleanup: print(f"main 函数的 finally 块中最终清理时出错: {e_final_cleanup}"); sys.exit(1)
+        else: print("提示: ProcessManager (pm) 未初始化，跳过 main 函数 finally 块中的清理调用。")
 
 if __name__ == "__main__":
-    main()
+    try: main()
+    except SystemExit as e:
+        if e.code != 0: print(f"脚本最终以错误代码 {e.code} 退出。")
+    except Exception as e_global:
+        print(f"[严重错误] 全局范围发生未处理异常: {e_global}")
+        import traceback; traceback.print_exc(); sys.exit(1)
