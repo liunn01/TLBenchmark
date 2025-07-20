@@ -1,0 +1,7 @@
+matplotlib>=3.4
+pandas
+openpyxl
+psutil>=5.8
+requests>=2.25
+vllm
+datasets 
